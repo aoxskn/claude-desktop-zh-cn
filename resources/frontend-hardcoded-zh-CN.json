@@ -572,10 +572,6 @@
     "使用你组织的 UUID 标记诊断数据事件，方便 Anthropic 支持人员定位。不会用于认证。"
   ],
   [
-    "tokens",
-    "令牌"
-  ],
-  [
     "Users see only this provider at the login screen. The option to sign in to Claude.ai is hidden.",
     "用户在登录页只会看到此提供商。Claude.ai 登录选项会被隐藏。"
   ],
