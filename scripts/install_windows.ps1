@@ -1520,6 +1520,23 @@ function Test-StructuralJsLiteralContext {
     )
 }
 
+function Test-LiteralBodySafe {
+    param(
+        [string]$Body,
+        [string]$Delimiter
+    )
+
+    # 定界包裹式替换的译文必须仍是同一个字面量的合法内容：裸引号会提前闭合，
+    # 裸反斜杠会把收尾引号转义掉，模板里的 ${ 会变成表达式。
+    if ($Delimiter -eq '`') {
+        return -not $Body.Contains('${')
+    }
+    if ($Body.Contains($Delimiter)) {
+        return $false
+    }
+    return -not ($Body.Contains('\') -or $Body.Contains("`n") -or $Body.Contains("`r"))
+}
+
 function Replace-FrontendHardcodedText {
     param(
         [string]$Text,
@@ -1531,17 +1548,11 @@ function Replace-FrontendHardcodedText {
         return @{ Text = $Text; Count = 0 }
     }
 
+    # 只保留定界包裹式规则（正则整体替换 `引号+原文+引号`）。直接替换规则不做字面量
+    # 边界核对，改动它们正是历史损坏（SyntaxError 白屏）的来源；没有原生扫描器时
+    # 宁可少翻几句，也不要写出坏文件。
     if (-not (Test-PlainUiTextReplacement $Source)) {
-        $occurrences = 0
-        $index = $Text.IndexOf($Source, [System.StringComparison]::Ordinal)
-        while ($index -ge 0) {
-            $occurrences += 1
-            $index = $Text.IndexOf($Source, $index + $Source.Length, [System.StringComparison]::Ordinal)
-        }
-        if ($occurrences -gt 0) {
-            $Text = $Text.Replace($Source, $Target)
-        }
-        return @{ Text = $Text; Count = $occurrences }
+        return @{ Text = $Text; Count = 0 }
     }
 
     if (-not $Text.Contains($Source)) {
@@ -1558,8 +1569,11 @@ function Replace-FrontendHardcodedText {
             if (Test-StructuralJsLiteralContext $Text $match.Index) {
                 return $match.Value
             }
-            $script:__frontendReplacementCount += 1
             $quote = $match.Groups["quote"].Value
+            if (-not (Test-LiteralBodySafe $Target $quote)) {
+                return $match.Value
+            }
+            $script:__frontendReplacementCount += 1
             return "$quote$Target$quote"
         }
     )
@@ -2359,6 +2373,7 @@ function Patch-OnlineDomTranslation {
 
 $script:FrontendPatcherCSharp = @'
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -2367,10 +2382,357 @@ using System.Threading.Tasks;
 
 namespace ClaudeZhPatch
 {
+    public struct LitSpan
+    {
+        public readonly int Start;
+        public readonly int End;
+        public readonly char Delim;
+
+        // 注意：这里必须保持 C# 5 语法（不要给 struct 加 readonly，那是 C# 7.2）。
+        // Windows PowerShell 5.1 的 Add-Type 只带 C# 5 编译器，一旦整段编译失败，
+        // Add-Type 会被静默吞掉（见下方调用点），补丁器连同语法安全闸一起失效。
+        public LitSpan(int start, int end, char delim)
+        {
+            Start = start;
+            End = end;
+            Delim = delim;
+        }
+    }
+
+    // JS 字面量扫描：语法安全的前提。
+    //
+    // 压缩后的 bundle 里，一段英文文案既可能是字符串内容，也可能是标识符、对象键、
+    // 正则或注释的一部分。早期实现直接 Replace(source, target)，完全不看语法，
+    // 于是译文一旦改变了引号/括号/转义配对关系，就会把字符串提前闭合、插进多余的
+    // 括号，产出 SyntaxError，整个页面白屏。
+    //
+    // 这里的不变量：**只允许改动字符串字面量的内部**。把字面量与注释折叠成单个标记后，
+    // 剩下的「代码骨架」必须逐字节不变（CodeShape）。
     public static class FrontendPatcher
     {
         static readonly Regex StructuralContextRe = new Regex(
             "(?<![A-Za-z0-9_$-])(?:as|component|displayName|glyph|[\\w$-]*[Ii]con(?:Name)?|name|role|type)\\s*[:=]\\s*(?:(?:(?:(?:[^?:\\\"'`,;{}]|\\\"[^\\\"]{0,60}\\\"|'[^']{0,60}'|`[^`]{0,60}`){1,120}?)\\?\\??\\s*(?:\\\"[^\\\"]{0,80}\\\"|'[^']{0,80}'|`[^`]{0,80}`)\\s*:\\s*)*)(?:(?:(?:[^?:\\\"'`,;{}]|\\\"[^\\\"]{0,60}\\\"|'[^']{0,60}'|`[^`]{0,60}`){1,120}?)(?:\\?\\??)?\\s*)?(?:=\\s*)?$");
+
+        static readonly char[] Specials = { '"', '\'', '`', '/' };
+
+        static bool IsIdentStart(char c)
+        {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$';
+        }
+
+        static bool IsIdentPart(char c)
+        {
+            return IsIdentStart(c) || (c >= '0' && c <= '9');
+        }
+
+        // 这些关键字后面是「值位置」：紧跟的 / 一定是正则起点，不是除法。
+        // 漏判的代价很大——`return/%[0-9a-f]{2}/i` 若按除法处理，正则的结束斜杠
+        // 会被当成下一个正则的起点，整条正则连同后面的字符串一起被吞掉，字面量
+        // 边界从这里整段错位（ion-dist 里 `return/re/`、`of/re/` 全是这种写法）。
+        // 后果有两层：文件级闸误判整包（白翻），命中级闸把代码当成字面量内容（会写坏）。
+        static bool IsValueKeyword(string word)
+        {
+            switch (word)
+            {
+                case "return": case "typeof": case "instanceof": case "in": case "of":
+                case "new": case "delete": case "void": case "case": case "do": case "else":
+                case "yield": case "await": case "throw":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        // `${...}` / `{...}` 内部：字符串、嵌套模板、正则、行注释都可能藏着花括号，
+        // 直接数括号会在 `${obj["}"]}` 这种写法上提前闭合，所以逐个构造递归跳过。
+        static int ScanJsBraces(string text, int index, int length)
+        {
+            while (index < length)
+            {
+                char c = text[index];
+                if (c == '\\') { index += 2; continue; }
+                if (c == '"' || c == '\'' || c == '`')
+                {
+                    int quoted = ScanJsQuoted(text, index, c);
+                    if (quoted <= index) return length;
+                    index = quoted;
+                    continue;
+                }
+                if (c == '/')
+                {
+                    char following = index + 1 < length ? text[index + 1] : '\0';
+                    if (following == '/')
+                    {
+                        int lineEnd = text.IndexOf('\n', index);
+                        index = lineEnd < 0 ? length : lineEnd + 1;
+                        continue;
+                    }
+                    if (following == '*')
+                    {
+                        int blockEnd = text.IndexOf("*/", index + 2, StringComparison.Ordinal);
+                        index = blockEnd < 0 ? length : blockEnd + 2;
+                        continue;
+                    }
+                    index++;
+                    continue;
+                }
+                if (c == '{')
+                {
+                    index = ScanJsBraces(text, index + 1, length);
+                    continue;
+                }
+                if (c == '}') return index + 1;
+                index++;
+            }
+            return length;
+        }
+
+        static int ScanJsQuoted(string text, int start, char delim)
+        {
+            int index = start + 1;
+            int length = text.Length;
+            if (delim == '`')
+            {
+                while (index < length)
+                {
+                    char c = text[index];
+                    if (c == '\\') { index += 2; continue; }
+                    if (c == '$' && index + 1 < length && text[index + 1] == '{')
+                    {
+                        index = ScanJsBraces(text, index + 2, length);
+                        continue;
+                    }
+                    if (c == '`') return index + 1;
+                    index++;
+                }
+                return length;
+            }
+            while (index < length)
+            {
+                char c = text[index];
+                if (c == '\\') { index += 2; continue; }
+                if (c == delim) return index + 1;
+                // 未闭合（损坏文件）：停在这里，避免整文件错位
+                if (c == '\n') return index;
+                index++;
+            }
+            return length;
+        }
+
+        static int ScanJsRegex(string text, int start)
+        {
+            int index = start + 1;
+            int length = text.Length;
+            bool inClass = false;
+            while (index < length)
+            {
+                char c = text[index];
+                if (c == '\\') { index += 2; continue; }
+                if (c == '[') inClass = true;
+                else if (c == ']') inClass = false;
+                else if (c == '/' && !inClass)
+                {
+                    index++;
+                    while (index < length && IsIdentPart(text[index])) index++;
+                    return index;
+                }
+                else if (c == '\n') return start;
+                index++;
+            }
+            return start;
+        }
+
+        // 线性扫描，返回 (start, end, delimiter)。注释与正则不会出现在结果里。
+        public static List<LitSpan> LiteralSpans(string text)
+        {
+            var spans = new List<LitSpan>();
+            int length = text.Length;
+            int index = 0;
+            // 记录「上一个有效记号是否产生值」：标识符/数字/字面量/)/] 之后是除法，
+            // 运算符/括号/逗号之后才是正则起点。只看前一个字符会把 if(x)/re/.test() 误判。
+            bool afterValue = false;
+            while (index < length)
+            {
+                char c = text[index];
+                if (Array.IndexOf(Specials, c) >= 0)
+                {
+                    int jump = length;
+                    foreach (char s in Specials)
+                    {
+                        int found = text.IndexOf(s, index + 1);
+                        if (found >= 0 && found < jump) jump = found;
+                    }
+                    if (c == '/')
+                    {
+                        char following = index + 1 < length ? text[index + 1] : '\0';
+                        if (following == '/')
+                        {
+                            int end = text.IndexOf('\n', index);
+                            index = end < 0 ? length : end + 1;
+                            afterValue = false;
+                            continue;
+                        }
+                        if (following == '*')
+                        {
+                            int end = text.IndexOf("*/", index + 2, StringComparison.Ordinal);
+                            index = end < 0 ? length : end + 2;
+                            afterValue = false;
+                            continue;
+                        }
+                        if (!afterValue)
+                        {
+                            int end = ScanJsRegex(text, index);
+                            if (end != index)
+                            {
+                                index = end;
+                                afterValue = true;
+                                continue;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        int end = ScanJsQuoted(text, index, c);
+                        spans.Add(new LitSpan(index, end, c));
+                        index = end;
+                        afterValue = true;
+                        continue;
+                    }
+                    // 落到 jump：跳过的区间里可能藏着运算符（=、,、return 之类），按落点
+                    // 前面最近的有效记号重算一次。少了这一步，上一次除法留下的 true 会
+                    // 一路传染，`var a=b/c;var r=/re/` 里的正则会被当成除号，字面量
+                    // 边界从这里开始整段错位。
+                    int slash = index;
+                    int back = jump - 1;
+                    while (back >= 0 && char.IsWhiteSpace(text[back])) back--;
+                    if (back == slash) back = slash - 1;
+                    while (back >= 0 && char.IsWhiteSpace(text[back])) back--;
+                    index = jump;
+                    afterValue = back >= 0 && (IsIdentPart(text[back]) || text[back] == ')' || text[back] == ']');
+                    continue;
+                }
+                if (IsIdentStart(c))
+                {
+                    int identEnd = index;
+                    while (identEnd < length && IsIdentPart(text[identEnd])) identEnd++;
+                    afterValue = !IsValueKeyword(text.Substring(index, identEnd - index));
+                    index = identEnd;
+                    continue;
+                }
+                if (!char.IsWhiteSpace(c)) afterValue = IsIdentPart(c) || c == ')' || c == ']';
+                index++;
+            }
+            return spans;
+        }
+
+        // 折叠所有字面量后的代码骨架；骨架相同 ⇒ 代码结构相同 ⇒ 语法必然仍然成立。
+        public static string CodeShape(string text, List<LitSpan> spans)
+        {
+            var builder = new StringBuilder(text.Length);
+            int cursor = 0;
+            foreach (LitSpan span in spans)
+            {
+                builder.Append(text, cursor, span.Start - cursor);
+                builder.Append(span.Delim == '`' ? 'T' : 'S');
+                cursor = span.End;
+            }
+            builder.Append(text, cursor, text.Length - cursor);
+            return builder.ToString();
+        }
+
+        static bool DelimitersMatch(string source, string target)
+        {
+            List<LitSpan> a = LiteralSpans(source);
+            List<LitSpan> b = LiteralSpans(target);
+            if (a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+            {
+                if (a[i].Delim != b[i].Delim) return false;
+            }
+            return true;
+        }
+
+        static int CountChar(string text, char c)
+        {
+            int count = 0;
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (text[i] == c) count++;
+            }
+            return count;
+        }
+
+        // 译文是否引入了原文没有的反斜杠转义：\" 之类会提前闭合字符串或改变配对。
+        static bool IntroducesNewEscapes(string source, string target)
+        {
+            return CountChar(target, '\\') > CountChar(source, '\\');
+        }
+
+        // 规则级安全判定：放行条件与 patch_claude_zh_cn.replacement_is_translatable 一致。
+        public static bool IsTranslatable(string source, string target)
+        {
+            List<LitSpan> own = LiteralSpans(source);
+            List<LitSpan> targetSpans = LiteralSpans(target);
+            // 片段里一个引号都没有时（纯文案原文），骨架比对会退化成「整串相等」而误杀规则；
+            // 这类规则能否安全落地交给命中级判定 ReplacementIsLiteralSafe。
+            if (own.Count > 0 || targetSpans.Count > 0)
+            {
+                if (own.Count != targetSpans.Count) return false;
+                if (!string.Equals(CodeShape(source, own), CodeShape(target, targetSpans), StringComparison.Ordinal)) return false;
+            }
+            if (!DelimitersMatch(source, target)) return false;
+            if (IntroducesNewEscapes(source, target)) return false;
+            if (target.IndexOf('\n') >= 0 || target.IndexOf('\r') >= 0) return false;
+            if (target.Contains("${") && !source.Contains("${")) return false;
+            return true;
+        }
+
+        // 单次替换是否不会撑破字符串：命中只能与片段自身的字面量边界重合，
+        // 或整体落在某个字面量内部；部分重叠一律拒绝。
+        static bool ReplacementIsLiteralSafe(string source, string target, int start, List<LitSpan> spans, List<LitSpan> own)
+        {
+            int end = start + source.Length;
+            // spans 按起点递增且互不重叠：二分定位后最多只需看「跨过 start 的那个」
+            // 以及起点落在命中区间内的那些，不必整表扫描。
+            int lo = 0;
+            int hi = spans.Count;
+            while (lo < hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                if (spans[mid].Start < start) lo = mid + 1;
+                else hi = mid;
+            }
+            for (int index = lo > 0 ? lo - 1 : 0; index < spans.Count && spans[index].Start < end; index++)
+            {
+                LitSpan span = spans[index];
+                if (span.End <= start || span.Start >= end) continue;
+                bool aligned = false;
+                // own 里的坐标相对片段起点，比较时先平移到文件坐标
+                foreach (LitSpan candidate in own)
+                {
+                    int absStart = start + candidate.Start;
+                    int absEnd = start + candidate.End;
+                    if (absStart == span.Start && absEnd == span.End && candidate.Delim == span.Delim)
+                    {
+                        aligned = true;
+                        break;
+                    }
+                }
+                if (aligned) continue;
+                if (span.Start < start && span.End > end) continue;
+                return false;
+            }
+            if (IntroducesNewEscapes(source, target)) return false;
+            if (target.Contains("${") && !source.Contains("${")) return false;
+            return true;
+        }
+
+        // 定界包裹式替换的译文是否仍是一个合法的同种字面量内容
+        static bool LiteralBodyIsSafe(string body, char delim)
+        {
+            if (delim == '`') return body.IndexOf('`') < 0 && !body.Contains("${");
+            return body.IndexOf(delim) < 0 && body.IndexOf('\\') < 0 && body.IndexOf('\n') < 0 && body.IndexOf('\r') < 0;
+        }
 
         static bool IsStructuralJsLiteralContext(string text, int literalStart)
         {
@@ -2379,65 +2741,121 @@ namespace ClaudeZhPatch
             return StructuralContextRe.IsMatch(prefix);
         }
 
-        static int CountOrdinal(string text, string source)
+        // rules 行结构: [Regex(定界包裹式规则, 直接替换规则为 null), source, target]，顺序与词表一致。
+        // quotedOnly=true 时只跑定界包裹式规则：整体替换 `引号+原文+引号`，结构上不会动到字面量边界。
+        static string ApplyRules(
+            string text,
+            object[][] rules,
+            bool[] translatable,
+            List<LitSpan>[] ownSpans,
+            List<LitSpan> spans,
+            bool quotedOnly,
+            out int count)
         {
-            int occurrences = 0;
-            int index = text.IndexOf(source, StringComparison.Ordinal);
-            while (index >= 0)
+            string patched = text;
+            count = 0;
+            for (int r = 0; r < rules.Length; r++)
             {
-                occurrences++;
-                index = text.IndexOf(source, index + source.Length, StringComparison.Ordinal);
+                object[] rule = rules[r];
+                string source = (string)rule[1];
+                if (!patched.Contains(source)) continue;
+                Regex regex = (Regex)rule[0];
+                string target = (string)rule[2];
+                if (regex != null)
+                {
+                    // 定界包裹式规则不在规则级判定范围内（它的原文本身就是裸文案，
+                    // 骨架必然不同），安全保证来自「整体替换引号+原文+引号」+ 译文核对。
+                    string current = patched;
+                    int localCount = 0;
+                    patched = regex.Replace(current, delegate(Match m)
+                    {
+                        char quote = m.Groups["quote"].Value[0];
+                        if (IsStructuralJsLiteralContext(current, m.Index)) return m.Value;
+                        if (!LiteralBodyIsSafe(target, quote)) return m.Value;
+                        localCount++;
+                        return quote + target + quote;
+                    });
+                    count += localCount;
+                    if (localCount > 0) spans = LiteralSpans(patched);
+                }
+                else
+                {
+                    if (quotedOnly || !translatable[r]) continue;
+                    // 逐处判定、逐处拼接：不能用 Replace(source, target)，
+                    // 那会把上面判定为不安全的命中一起替换掉（等价于没做命中级检查）。
+                    var pieces = new StringBuilder();
+                    int cursor = 0;
+                    int occurrences = 0;
+                    int index = patched.IndexOf(source, StringComparison.Ordinal);
+                    while (index >= 0)
+                    {
+                        if (ReplacementIsLiteralSafe(source, target, index, spans, ownSpans[r]))
+                        {
+                            pieces.Append(patched, cursor, index - cursor);
+                            pieces.Append(target);
+                            cursor = index + source.Length;
+                            occurrences++;
+                        }
+                        index = patched.IndexOf(source, index + 1, StringComparison.Ordinal);
+                    }
+                    if (occurrences > 0)
+                    {
+                        pieces.Append(patched, cursor, patched.Length - cursor);
+                        patched = pieces.ToString();
+                        count += occurrences;
+                        spans = LiteralSpans(patched);
+                    }
+                }
             }
-            return occurrences;
+            return patched;
         }
 
-        // rules 行结构: [Regex(plain 规则, 直接替换规则为 null), source, target]，顺序与词表一致。
         // 纯计算：不读盘之外不做任何副作用，变更后的内容写入 outputContents[i]，由调用方备份并写盘。
         // 返回每个文件的替换计数（未变更为 0）。
         public static int[] PatchFiles(string[] filePaths, object[][] rules, int maxWorkers, string[] outputContents)
         {
             int total = filePaths.Length;
+            int ruleCount = rules.Length;
+            // 规则级判定只做一次：285 条规则的骨架扫描远小于对上千个文件的重复计算。
+            var translatable = new bool[ruleCount];
+            var ownSpans = new List<LitSpan>[ruleCount];
+            for (int r = 0; r < ruleCount; r++)
+            {
+                string source = (string)rules[r][1];
+                string target = (string)rules[r][2];
+                translatable[r] = IsTranslatable(source, target);
+                ownSpans[r] = LiteralSpans(source);
+            }
+
             int scanned = 0;
             int[] counts = new int[total];
             Parallel.For(0, total, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxWorkers) }, delegate(int i)
             {
                 string filePath = filePaths[i];
                 string text = File.ReadAllText(filePath, Encoding.UTF8);
-                string patched = text;
-                int count = 0;
-                for (int r = 0; r < rules.Length; r++)
+                int count;
+                // spans 是整轮规则共享的坐标表：某条规则真的替换了就重新扫描一次，
+                // 否则后面规则的命中位置会被前面的替换推移、判定就会失准。
+                List<LitSpan> spans = LiteralSpans(text);
+                string patched = ApplyRules(text, rules, translatable, ownSpans, spans, false, out count);
+                if (!string.Equals(patched, text, StringComparison.Ordinal)
+                    && !string.Equals(CodeShape(text, spans), CodeShape(patched, LiteralSpans(patched)), StringComparison.Ordinal))
                 {
-                    object[] rule = rules[r];
-                    string source = (string)rule[1];
-                    if (!patched.Contains(source))
+                    // 写盘前的最后一道闸：骨架不同即说明某次替换动到了字符串边界或插入了
+                    // 括号/转义，会产出 SyntaxError 导致整页白屏。退一步只跑定界包裹式规则。
+                    patched = ApplyRules(text, rules, translatable, ownSpans, spans, true, out count);
+                    if (!string.Equals(patched, text, StringComparison.Ordinal)
+                        && !string.Equals(CodeShape(text, spans), CodeShape(patched, LiteralSpans(patched)), StringComparison.Ordinal))
                     {
-                        continue;
-                    }
-                    Regex regex = (Regex)rule[0];
-                    string target = (string)rule[2];
-                    if (regex != null)
-                    {
-                        string current = patched;
-                        int localCount = 0;
-                        patched = regex.Replace(current, delegate(Match m)
+                        patched = text;
+                        count = 0;
+                        outputContents[i] = null;
+                        int skipped = Interlocked.Increment(ref scanned);
+                        if (skipped % 250 == 0 || skipped == total)
                         {
-                            if (IsStructuralJsLiteralContext(current, m.Index))
-                            {
-                                return m.Value;
-                            }
-                            localCount++;
-                            return m.Groups["quote"].Value + target + m.Groups["quote"].Value;
-                        });
-                        count += localCount;
-                    }
-                    else
-                    {
-                        int occurrences = CountOrdinal(patched, source);
-                        if (occurrences > 0)
-                        {
-                            patched = patched.Replace(source, target);
-                            count += occurrences;
+                            Console.WriteLine("  scanned " + skipped + "/" + total + " JS files");
                         }
+                        return;
                     }
                 }
                 if (count > 0 && !string.Equals(patched, text, StringComparison.OrdinalIgnoreCase))
@@ -2521,6 +2939,7 @@ function Patch-HardcodedFrontendStrings {
             }
         }
     } else {
+        Write-Host "  fallback scan: only delimiter-wrapped rules are applied (direct-replace rules skipped for syntax safety)" -ForegroundColor DarkYellow
         foreach ($file in $jsFiles) {
             $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
             $patched = $text
