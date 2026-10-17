@@ -2447,6 +2447,10 @@ namespace ClaudeZhPatch
         // 直接数括号会在 `${obj["}"]}` 这种写法上提前闭合，所以逐个构造递归跳过。
         static int ScanJsBraces(string text, int index, int length)
         {
+            // 与主循环一样需要区分「正则字面量」和「除号」：`${x.replace(/[`]/g,"")}`
+            // 里如果漏掉正则，反引号会被当成模板定界符，扫描器状态从此反相，
+            // 后面几十 KB 的代码全被当成字面量（字面量边界整体错位）。
+            bool afterValue = false;
             while (index < length)
             {
                 char c = text[index];
@@ -2456,6 +2460,7 @@ namespace ClaudeZhPatch
                     int quoted = ScanJsQuoted(text, index, c);
                     if (quoted <= index) return length;
                     index = quoted;
+                    afterValue = true;
                     continue;
                 }
                 if (c == '/')
@@ -2465,23 +2470,46 @@ namespace ClaudeZhPatch
                     {
                         int lineEnd = text.IndexOf('\n', index);
                         index = lineEnd < 0 ? length : lineEnd + 1;
+                        afterValue = false;
                         continue;
                     }
                     if (following == '*')
                     {
                         int blockEnd = text.IndexOf("*/", index + 2, StringComparison.Ordinal);
                         index = blockEnd < 0 ? length : blockEnd + 2;
+                        afterValue = false;
                         continue;
                     }
+                    if (!afterValue)
+                    {
+                        int regexEnd = ScanJsRegex(text, index);
+                        if (regexEnd != index)
+                        {
+                            index = regexEnd;
+                            afterValue = true;
+                            continue;
+                        }
+                    }
                     index++;
+                    afterValue = false;
                     continue;
                 }
                 if (c == '{')
                 {
                     index = ScanJsBraces(text, index + 1, length);
+                    afterValue = true;
                     continue;
                 }
                 if (c == '}') return index + 1;
+                if (IsIdentStart(c))
+                {
+                    int identEnd = index;
+                    while (identEnd < length && IsIdentPart(text[identEnd])) identEnd++;
+                    afterValue = !IsValueKeyword(text.Substring(index, identEnd - index));
+                    index = identEnd;
+                    continue;
+                }
+                if (!char.IsWhiteSpace(c)) afterValue = IsIdentPart(c) || c == ')' || c == ']';
                 index++;
             }
             return length;
@@ -2673,14 +2701,16 @@ namespace ClaudeZhPatch
         {
             List<LitSpan> own = LiteralSpans(source);
             List<LitSpan> targetSpans = LiteralSpans(target);
-            // 片段里一个引号都没有时（纯文案原文），骨架比对会退化成「整串相等」而误杀规则；
-            // 这类规则能否安全落地交给命中级判定 ReplacementIsLiteralSafe。
-            if (own.Count > 0 || targetSpans.Count > 0)
+            // 规则原文是一个 JS 片段而不是完整源文件，英文散文里的撇号（provider's、doesn't）
+            // 会被当成单引号字面量，导致 span 数与定界符对不上而误杀整条规则。
+            // 真正的安全保证来自命中级判定 ReplacementIsLiteralSafe 与写盘前的文件级骨架闸，
+            // 所以这里只在两侧都识别出字面量时才做骨架/定界符比对。
+            if (own.Count > 0 && targetSpans.Count > 0)
             {
                 if (own.Count != targetSpans.Count) return false;
                 if (!string.Equals(CodeShape(source, own), CodeShape(target, targetSpans), StringComparison.Ordinal)) return false;
+                if (!DelimitersMatch(source, target)) return false;
             }
-            if (!DelimitersMatch(source, target)) return false;
             if (IntroducesNewEscapes(source, target)) return false;
             if (target.IndexOf('\n') >= 0 || target.IndexOf('\r') >= 0) return false;
             if (target.Contains("${") && !source.Contains("${")) return false;

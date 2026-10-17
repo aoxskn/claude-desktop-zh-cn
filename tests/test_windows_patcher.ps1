@@ -90,6 +90,13 @@ Assert-True '转义种类没变即可翻译' (
         'help:{body:"a\nb\n', 'help:{body:"中\n文\n'))
 Assert-True '译文新增转义序列被拒' (
     -not [ClaudeZhPatch.FrontendPatcher]::IsTranslatable('t("a")', 't("他说\"好\"")'))
+# 规则原文是 JS 片段而不是完整文件：英文散文里的撇号（provider's、doesn't）会被当成
+# 单引号字面量，若拿它和「没有撇号的中文译文」比 span 数就会误杀整条规则。
+# 落地安全由命中级判定与文件级骨架闸负责，规则级不该因此否决。
+Assert-True '英文散文里的撇号不误杀规则' (
+    [ClaudeZhPatch.FrontendPatcher]::IsTranslatable(
+        "long:I(`"Auto-populate from the provider's model list. A config that doesn't set this key skips it.`")",
+        'long:I("启动时从提供商的模型列表自动填充。配置中未设置此键时跳过。")'))
 
 # ---- 字面量扫描（LiteralSpans）---------------------------------------------
 # Python 侧 frontend_literal_spans 的镜像。字面量边界算错的后果有两层：
@@ -110,6 +117,12 @@ Assert-Equal '关键字后面的斜杠是正则' '"/mnt/","\\"' (
     (Get-SpanTexts 'return/%[0-9a-f]{2}/i.test(t)?t.startsWith("/mnt/"):t.includes("\\")?1:2') -join ',')
 Assert-Equal '关键字规则不影响除法' '"s"' (
     (Get-SpanTexts 'var a=in/x;return a+"s";') -join ',')
+# ${} 里的正则字面量含反引号时，如果不按正则跳过，反引号会被当成模板定界符，
+# 扫描器状态从此反相——后面几十 KB 的代码全被当成字面量内容，文件级闸随即误拒整份文件。
+Assert-Equal '模板插值里的正则含反引号不会让扫描器脱同步' '`x${b.replace(/[`]/g,"y")}`,"z"' (
+    (Get-SpanTexts 'a=`x${b.replace(/[`]/g,"y")}`;c="z"') -join ',')
+Assert-Equal '真机片段：模板插值里的正则含反引号' '`[${(r.length>9?`${r.slice(0,9)}`:n).replace(/[\\[\]`<]/g,"")}](#${e})`,"tail"' (
+    (Get-SpanTexts 'return`[${(r.length>9?`${r.slice(0,9)}`:n).replace(/[\\[\]`<]/g,"")}](#${e})`;var Tk="tail"') -join ',')
 
 # ---- 文件级闸 --------------------------------------------------------------
 function Invoke-Patcher {
